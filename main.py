@@ -1,3 +1,4 @@
+from command_db import COMMANDS
 from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
 from semantic_matcher import get_best_intent, extract_entities, update_conversation_state, suggest_similar_intents
