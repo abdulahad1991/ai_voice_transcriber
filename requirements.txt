@@ -6,3 +6,5 @@ torch
 sentence-transformers
 transformers
 regex
+fuzzywuzzy
+python-Levenshtein

@@ -74,20 +74,19 @@ COMMANDS = {
     ],
     "REQUEST_FROM_PERSON": [
         "i want to request money from someone",
-        "mje ali se paise lene hain",
-        "i want to ask ali for money",
         "request money from x",
         "x se paise mangwani hain",
         "request payment from x",
-        "ali se payment mangni hai"
     ],
     "LOGOUT": [
         "log me out",
+        "log out",
         "logout krdo",
         "sign out karo",
         "app se logout",
         "sign me out",
-        "mje logout krna hai"
+        "mje logout krna hai",
+        "logout"
     ],
     "LOGIN": [
         "i want to log in",

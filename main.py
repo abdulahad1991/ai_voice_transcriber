@@ -1,8 +1,13 @@
 from command_db import COMMANDS
 from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
-from semantic_matcher import get_best_intent, extract_entities, update_conversation_state, suggest_similar_intents
+from semantic_matcher import (
+    get_best_intent, extract_entities, extract_entities_with_context,
+    update_conversation_state, suggest_similar_intents,
+    extract_partial_intent_clues
+)
 from translate_utils import translate_to_english
+from conversation_manager import ConversationalManager
 import whisper
 import os
 import certifi
@@ -17,6 +22,8 @@ app = FastAPI()
 os.environ["HF_HOME"] = "C:/Users/raqib/.cache/huggingface"
 model = whisper.load_model("medium")  
 
+# Enhanced conversation management
+conv_manager = ConversationalManager()
 conversation_state = {}
 conversation_history = {}
 
@@ -62,20 +69,81 @@ async def voice_intent_handler(file: UploadFile = File(...)):
     user_id = "demo-user"
     user_context = conversation_state.get(user_id, {})
     last_intent = user_context.get("intent")
+    
+    # Get enhanced conversation context
+    conv_context = conv_manager.get_or_create_context(user_id)
+    conversation_turns = conv_context.get_recent_context(3)
+    
+    # Check for contextual references first ("that", "it", "same", etc.)
+    contextual_intent = conv_manager.handle_contextual_reference(english_translation, conv_context)
+    if contextual_intent:
+        intent = contextual_intent
+        entities = extract_entities_with_context(english_translation, conversation_turns)
+    else:
+        # Check if user is selecting from previous options
+        selected_intent = conv_manager.handle_option_selection(english_translation, conv_context)
+        if selected_intent:
+            intent = selected_intent
+            entities = extract_entities_with_context(english_translation, conversation_turns)
+        else:
+            # Extract intent/entities for both versions with context
+            intent_en = get_best_intent(
+                english_translation, 
+                context_intent=last_intent,
+                conversation_history=conversation_turns
+            )
+            intent_ur = get_best_intent(
+                urdu_translation,
+                context_intent=last_intent, 
+                conversation_history=conversation_turns
+            )
+            entities_en = extract_entities_with_context(english_translation, conversation_turns)
+            entities_ur = extract_entities_with_context(urdu_translation, conversation_turns)
+            
+            # Prefer English, fallback to Urdu if UNKNOWN
+            intent = intent_en if intent_en != "UNKNOWN" else intent_ur
+            entities = entities_en if intent_en != "UNKNOWN" else entities_ur
 
-    # Extract intent/entities for both versions
-    intent_en = get_best_intent(english_translation)
-    intent_ur = get_best_intent(urdu_translation)
-    entities_en = extract_entities(english_translation)
-    entities_ur = extract_entities(urdu_translation)
+    # Handle incomplete commands
+    is_incomplete, possible_intents = conv_manager.detect_incomplete_command(english_translation, intent)
+    
+    if is_incomplete and possible_intents:
+        # Store suggestions for follow-up
+        conv_context.suggested_intents = possible_intents
+        conv_context.incomplete_command_count += 1
+        
+        # Generate clarification with options
+        clarification_en = conv_manager.generate_clarification_options(possible_intents, "en")
+        clarification_ur = conv_manager.generate_clarification_options(possible_intents, "ur")
+        
+        messages = {
+            "en": clarification_en["message"],
+            "ur": clarification_ur["message"]
+        }
+        
+        # Add turn to conversation history
+        response_data = {
+            "transcription": original_text,
+            "language": detected_lang,
+            "translated": english_translation,
+            "intent": "INCOMPLETE_COMMAND",
+            "entities": entities,
+            "context_from": last_intent,
+            "messages": messages,
+            "confirm_required": False,
+            "suggested_commands": possible_intents,
+            "recent_memory": conversation_history.get(user_id, []),
+            "conversation_type": "clarification",
+            "options": possible_intents
+        }
+        
+        conv_context.add_turn(english_translation, "INCOMPLETE_COMMAND", entities, response_data)
+        return response_data
 
-    # Prefer English, fallback to Urdu if UNKNOWN
-    intent = intent_en if intent_en != "UNKNOWN" else intent_ur
-    entities = entities_en if intent_en != "UNKNOWN" else entities_ur
-
+    # Update conversation history
     history = conversation_history.get(user_id, [])
     history.append(english_translation)
-    conversation_history[user_id] = history[-3:]
+    conversation_history[user_id] = history[-5:]  # Keep more history for context
 
     # Multi-step flows
     if intent == "UNKNOWN" and last_intent:
@@ -91,7 +159,7 @@ async def voice_intent_handler(file: UploadFile = File(...)):
             if "phone_number" in entities and "password" in entities:
                 intent = "COMPLETE_SIGNUP"
 
-    confirm_required = intent in ["LOGOUT", "SEND_MONEY", "DELETE_ACCOUNT"]
+    confirm_required = intent in ["SEND_MONEY", "DELETE_ACCOUNT"]
     suggested_commands = []
 
     # --------- Dual-language message logic ---------
@@ -126,27 +194,53 @@ async def voice_intent_handler(file: UploadFile = File(...)):
         if not (entities_en.get("phone_number") and entities_en.get("password")):
             clarification_en = REPLY_TEMPLATES["SIGNUP_HELP"]["clarification"]["en"]
     elif intent == "LOGOUT":
-        clarification_en = REPLY_TEMPLATES["LOGOUT"]["confirm"]["en"]
+        # For logout, show success message instead of confirmation
+        clarification_en = None  # This will use build_success instead
     elif intent == "UNKNOWN":
-        suggested_commands = suggest_similar_intents(english_translation)
+        # Enhanced unknown handling with conversation context
+        suggested_commands = suggest_similar_intents(
+            english_translation, 
+            top_k=4,
+            conversation_context=conversation_turns
+        )
+        
+        # Try to extract partial intent clues
+        partial_clues = extract_partial_intent_clues(english_translation)
+        if partial_clues:
+            suggested_commands = list(set(suggested_commands + partial_clues))[:4]
+        
+        # Store suggestions for potential follow-up
+        conv_context.suggested_intents = suggested_commands
+        
         examples_en = []
         for sc in suggested_commands:
             phrases = COMMANDS.get(sc, [])
             for ex in phrases:
                 if all(ord(ch) < 128 for ch in ex):
                     examples_en.append(ex)
-                if len(examples_en) >= 2:
+                if len(examples_en) >= 3:
                     break
-            if len(examples_en) >= 2:
+            if len(examples_en) >= 3:
                 break
+                
         if not examples_en:
-            clarification_en = (
-                "Sorry, I couldn't understand your command. "
-                "You can try: 'Show my balance', 'Show my QR code', or 'Request money from Ali'."
-            )
+            if conv_context.incomplete_command_count > 0:
+                clarification_en = (
+                    "I'm still not sure what you want to do. Let me give you some options:\n"
+                    "1. Check your balance\n"
+                    "2. Show your QR code\n"
+                    "3. View transactions\n"
+                    "4. Request money from someone\n\n"
+                    "Just say the number or tell me what you'd like to do."
+                )
+            else:
+                clarification_en = (
+                    "Sorry, I couldn't understand your command. "
+                    "You can try: 'Show my balance', 'Show my QR code', or 'Request money from contacts'."
+                )
         else:
             clarification_en = REPLY_TEMPLATES["UNKNOWN"]["clarification"]["en"].format(
-                examples="; ".join(f"'{ex}'" for ex in examples_en[:2])
+                examples="; ".join(f"'{ex}'" for ex in examples_en[:3])
             )
     # URDU LOGIC
     clarification_ur = None
@@ -168,35 +262,55 @@ async def voice_intent_handler(file: UploadFile = File(...)):
         if not (entities_ur.get("phone_number") and entities_ur.get("password")):
             clarification_ur = REPLY_TEMPLATES["SIGNUP_HELP"]["clarification"]["ur"]
     elif intent == "LOGOUT":
-        clarification_ur = REPLY_TEMPLATES["LOGOUT"]["confirm"]["ur"]
+        # For logout, show success message instead of confirmation
+        clarification_ur = None  # This will use build_success instead
     elif intent == "UNKNOWN":
-        # Suggest Urdu commands
+        # Enhanced Urdu unknown handling
         examples_ur = []
         for sc in suggested_commands:
             phrases = COMMANDS.get(sc, [])
             for ex in phrases:
                 if any(ord(ch) > 128 for ch in ex) or any(w in ex.lower() for w in ["dikhao", "paise", "krdo", "hai", "kahan", "mje", "ki", "se"]):
                     examples_ur.append(ex)
-                if len(examples_ur) >= 2:
+                if len(examples_ur) >= 3:
                     break
-            if len(examples_ur) >= 2:
+            if len(examples_ur) >= 3:
                 break
+                
         if not examples_ur:
-            clarification_ur = (
-                "معذرت، میں سمجھ نہیں سکا۔ آپ یہ کہہ سکتے ہیں: 'میرا بیلنس دکھاؤ'، 'میرا کیو آر کوڈ دکھاؤ'، یا 'علی سے پیسے مانگو'۔"
-            )
+            if conv_context.incomplete_command_count > 0:
+                clarification_ur = (
+                    "معذرت، اب بھی سمجھ نہیں آیا۔ یہ آپشنز ہیں:\n"
+                    "1. اپنا بیلنس چیک کریں\n"
+                    "2. اپنا QR کوڈ دیکھیں\n"
+                    "3. ٹرانزیکشنز دیکھیں\n"
+                    "4. کسی سے پیسے مانگیں\n\n"
+                    "نمبر بولیں یا بتائیں کہ کیا کرنا چاہتے ہیں۔"
+                )
+            else:
+                clarification_ur = (
+                    "معذرت، میں سمجھ نہیں سکا۔ آپ یہ کہہ سکتے ہیں: 'میرا بیلنس دکھاؤ'، 'میرا کیو آر کوڈ دکھاؤ'، یا 'علی سے پیسے مانگو'۔"
+                )
         else:
             clarification_ur = REPLY_TEMPLATES["UNKNOWN"]["clarification"]["ur"].format(
-                examples="؛ ".join(f"'{ex}'" for ex in examples_ur[:2])
+                examples="؛ ".join(f"'{ex}'" for ex in examples_ur[:3])
             )
 
     # Construct the final messages
     messages = {
-        "en": clarification_en or build_success(intent, entities_en, "en"),
-        "ur": clarification_ur or build_success(intent, entities_ur, "ur")
+        "en": clarification_en or build_success(intent, entities, "en"),
+        "ur": clarification_ur or build_success(intent, entities, "ur")
     }
-
-    return {
+    
+    # Determine conversation type
+    conversation_type = "single_turn"
+    if conv_manager.should_continue_conversation(intent, entities):
+        conversation_type = "multi_turn"
+    elif clarification_en or clarification_ur:
+        conversation_type = "clarification"
+    
+    # Prepare response data
+    response_data = {
         "transcription": original_text,
         "language": detected_lang,
         "translated": english_translation,
@@ -206,8 +320,20 @@ async def voice_intent_handler(file: UploadFile = File(...)):
         "messages": messages,
         "confirm_required": confirm_required,
         "suggested_commands": suggested_commands,
-        "recent_memory": conversation_history[user_id]
+        "recent_memory": conversation_history[user_id],
+        "conversation_type": conversation_type,
+        "conversation_id": conv_context.user_id,
+        "turn_count": len(conv_context.conversation_flow) + 1
     }
+    
+    # Add this turn to conversation context
+    conv_context.add_turn(english_translation, intent, entities, response_data)
+    
+    # Update conversation state for multi-step flows
+    if intent not in ["UNKNOWN", "INCOMPLETE_COMMAND"]:
+        conversation_state[user_id] = {"intent": intent, "entities": entities}
+    
+    return response_data
 
 
 # Add this code to run the server directly with a custom port

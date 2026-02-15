@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python test:*)",
+      "Bash(python3:*)",
+      "Read(/Users/payfast-macbook/IdeaProjects/business_app/**)",
+      "Read(/Users/payfast-macbook/IdeaProjects/business_app/**)",
+      "Read(/Users/payfast-macbook/IdeaProjects/business_app/merchant/src/main/kotlin/com/payfast/businessapp/merchant/controllers/**)",
+      "Read(/Users/payfast-macbook/IdeaProjects/business_app/merchant/src/main/kotlin/com/payfast/businessapp/merchant/model/response/ai/**)",
+      "Read(/Users/payfast-macbook/Desktop/Projects/merchant_karandaaz/**)",
+      "Read(/Users/payfast-macbook/Desktop/Projects/merchant_karandaaz/lib/ui/views/voice/**)",
+      "Read(/Users/payfast-macbook/Desktop/Projects/merchant_karandaaz/lib/ui/views/voice/**)",
+      "Read(/Users/payfast-macbook/Desktop/Projects/merchant_karandaaz/lib/models/response/ai/**)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

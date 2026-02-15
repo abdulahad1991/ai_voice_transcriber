@@ -29,8 +29,6 @@ ROMAN_TO_ENG = {
     "recent payments": "show my payments",
     "mje paise dekhne hain": "check my balance",
     "mje x se paise lene hain": "i want to request money from someone",
-    "ali se paise mangwani hain": "i want to request money from someone",
-    "request money from ali": "i want to request money from someone",
     "mje logout krna hai": "log me out",
     "logout krdo": "log me out",
     "sign out karo": "log me out",

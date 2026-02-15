@@ -4,6 +4,7 @@ from reply_template import REPLY_TEMPLATES
 from transformers import pipeline
 import re
 from fuzzywuzzy import fuzz
+from typing import Optional, List, Tuple
 
 # --- Build keyword and phrase mappings ---
 phrase_to_intent = {}
@@ -71,38 +72,80 @@ def fuzzy_match(user_text, fuzzy_threshold=75):
         return best_intent, best_score / 100.0
     return None, 0
 
-def get_best_intent(user_text, semantic_threshold=0.50, fuzzy_threshold=75):
+def get_best_intent(user_text, semantic_threshold=0.50, fuzzy_threshold=75, context_intent=None, conversation_history=None):
+    # Enhanced intent matching with conversational context
+    
+    # 0. Handle contextual references first
+    if context_intent and _is_contextual_reference(user_text):
+        return context_intent
+        
     # 1. Keyword matching (high confidence)
     intent, confidence = keyword_match(user_text)
     if intent and confidence > 0.85:
         return intent
-    # 2. Semantic matching (transformer)
-    intent, confidence = semantic_match(user_text, semantic_threshold)
+        
+    # 2. Enhanced semantic matching with context
+    intent, confidence = semantic_match_with_context(user_text, semantic_threshold, context_intent, conversation_history)
     if intent:
         return intent
+        
     # 3. Fuzzy (typo-tolerant) matching fallback
     intent, confidence = fuzzy_match(user_text, fuzzy_threshold)
     if intent:
         return intent
-    # 4. Still nothing? Try partial matches again (for safety)
-    text_lower = user_text.lower()
-    for intent, phrases in intent_phrases.items():
-        for phrase in phrases:
-            if phrase in text_lower or text_lower in phrase:
-                return intent
+        
+    # 4. Partial matching with context awareness
+    intent = _partial_match_with_context(user_text, context_intent)
+    if intent:
+        return intent
+        
     return "UNKNOWN"
 
-def suggest_similar_intents(user_text, top_k=3):
+def suggest_similar_intents(user_text, top_k=3, conversation_context=None):
     query_embedding = model.encode(user_text, convert_to_tensor=True)
     scores = util.pytorch_cos_sim(query_embedding, command_embeddings)[0]
-    top_indices = scores.argsort(descending=True)[:top_k]
+    top_indices = scores.argsort(descending=True)[:top_k*2]  # Get more to filter
     suggestions = []
+    
+    # Boost scores for contextually relevant intents
+    if conversation_context:
+        recent_intents = _get_recent_intents(conversation_context)
+        for i in top_indices:
+            intent = sentence_to_intent[i]
+            if intent in recent_intents:
+                scores[i] *= 1.2  # Boost contextually relevant intents
+    
+    # Re-sort after boosting
+    top_indices = scores.argsort(descending=True)[:top_k*2]
+    
     for i in top_indices:
         if scores[i].item() > 0.3:
             intent = sentence_to_intent[i]
             if intent not in suggestions:
                 suggestions.append(intent)
+                if len(suggestions) >= top_k:
+                    break
     return suggestions[:top_k]
+
+def extract_entities_with_context(text, conversation_context=None):
+    """Enhanced entity extraction with conversation context"""
+    entities = extract_entities(text)
+    
+    # Try to fill missing entities from conversation context
+    if conversation_context:
+        recent_turns = conversation_context[-3:]  # Last 3 turns
+        for turn in reversed(recent_turns):
+            turn_entities = turn.get("entities", {})
+            
+            # Fill missing person names
+            if not entities.get("person_names") and turn_entities.get("person_names"):
+                entities["person_names"] = turn_entities["person_names"]
+            
+            # Fill missing amounts
+            if not entities.get("amounts") and turn_entities.get("amounts"):
+                entities["amounts"] = turn_entities["amounts"]
+    
+    return entities
 
 def extract_entities(text):
     entities = {"person_names": [], "amounts": []}
@@ -179,3 +222,116 @@ def update_conversation_state(user_id, intent, entities, state, lang_code):
         return REPLY_TEMPLATES[intent]["success"][lang_code]
 
     return f"✅ Detected intent: {intent}. Entities: {entities}"
+
+# Enhanced helper functions for conversational AI
+
+def _is_contextual_reference(text):
+    """Check if text contains contextual references like 'that', 'it', 'same'"""
+    contextual_words = [
+        "that", "it", "this", "same", "again", "repeat", "once more",
+        "wahi", "wohi", "yeh", "woh", "dubara", "phir se"
+    ]
+    text_lower = text.lower()
+    return any(word in text_lower for word in contextual_words)
+
+def semantic_match_with_context(user_text, threshold=0.50, context_intent=None, conversation_history=None):
+    """Enhanced semantic matching that considers conversation context"""
+    query_embedding = model.encode(user_text, convert_to_tensor=True)
+    scores = util.pytorch_cos_sim(query_embedding, command_embeddings)[0]
+    
+    # Boost scores for contextually relevant commands
+    if context_intent:
+        for i, intent in enumerate(sentence_to_intent):
+            if intent == context_intent or _is_related_intent(intent, context_intent):
+                scores[i] *= 1.3  # Boost related intents
+    
+    best_idx = scores.argmax().item()
+    best_score = scores[best_idx].item()
+    
+    if best_score >= threshold:
+        return sentence_to_intent[best_idx], best_score
+    return None, best_score
+
+def _is_related_intent(intent1, intent2):
+    """Check if two intents are related (e.g., both about transactions)"""
+    related_groups = [
+        ["SHOW_TRANSACTIONS", "SHOW_PAYMENTS", "SHOW_QR_TRANSACTIONS"],
+        ["SHOW_QR", "SHOW_QR_LOCATION"],
+        ["LOGIN", "LOGOUT", "SIGNUP_HELP"],
+        ["CHECK_BALANCE", "SHOW_TRANSACTIONS", "SHOW_PAYMENTS"]
+    ]
+    
+    for group in related_groups:
+        if intent1 in group and intent2 in group:
+            return True
+    return False
+
+def _partial_match_with_context(user_text, context_intent):
+    """Enhanced partial matching considering conversation context"""
+    text_lower = user_text.lower()
+    
+    # First try context-aware partial matching
+    if context_intent:
+        context_phrases = intent_phrases.get(context_intent, [])
+        for phrase in context_phrases:
+            if any(word in text_lower for word in phrase.split() if len(word) > 2):
+                return context_intent
+    
+    # Regular partial matching
+    for intent, phrases in intent_phrases.items():
+        for phrase in phrases:
+            if phrase in text_lower or text_lower in phrase:
+                return intent
+    return None
+
+def _get_recent_intents(conversation_context, max_turns=3):
+    """Extract recent intents from conversation context"""
+    if not conversation_context:
+        return []
+    
+    recent_intents = []
+    for turn in conversation_context[-max_turns:]:
+        if turn.get("intent") and turn["intent"] != "UNKNOWN":
+            recent_intents.append(turn["intent"])
+    return recent_intents
+
+def extract_partial_intent_clues(text):
+    """Extract clues from incomplete commands"""
+    text_lower = text.lower().strip()
+    clues = []
+    
+    # Common action words
+    action_words = {
+        "show": ["SHOW_QR", "SHOW_TRANSACTIONS", "CHECK_BALANCE"],
+        "check": ["CHECK_BALANCE", "SHOW_TRANSACTIONS"],
+        "send": ["REQUEST_FROM_PERSON"],
+        "request": ["REQUEST_FROM_PERSON"],
+        "get": ["CHECK_BALANCE", "SHOW_QR"],
+        "see": ["SHOW_QR", "CHECK_BALANCE", "SHOW_TRANSACTIONS"],
+        "dikhao": ["SHOW_QR", "SHOW_TRANSACTIONS", "CHECK_BALANCE"],
+        "dekho": ["SHOW_QR", "SHOW_TRANSACTIONS", "CHECK_BALANCE"],
+        "bhejo": ["REQUEST_FROM_PERSON"],
+        "mangna": ["REQUEST_FROM_PERSON"]
+    }
+    
+    # Object words
+    object_words = {
+        "balance": ["CHECK_BALANCE"],
+        "money": ["REQUEST_FROM_PERSON", "CHECK_BALANCE"],
+        "qr": ["SHOW_QR", "SHOW_QR_LOCATION"],
+        "code": ["SHOW_QR"],
+        "transaction": ["SHOW_TRANSACTIONS", "SHOW_QR_TRANSACTIONS"],
+        "payment": ["SHOW_PAYMENTS"],
+        "paise": ["CHECK_BALANCE", "REQUEST_FROM_PERSON"],
+        "setting": ["OPEN_SETTINGS"]
+    }
+    
+    words = text_lower.split()
+    for word in words:
+        if word in action_words:
+            clues.extend(action_words[word])
+        if word in object_words:
+            clues.extend(object_words[word])
+    
+    # Return unique suggestions
+    return list(set(clues))
